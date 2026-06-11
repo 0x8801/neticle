@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests
+        run: |
+          mkdir -p build
+          swiftc -o build/neticle-tests Sources/Core.swift Tests/main.swift
+          ./build/neticle-tests
+
+      - name: Build app
+        run: ./build.sh
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Neticle.app
+          path: Neticle.app

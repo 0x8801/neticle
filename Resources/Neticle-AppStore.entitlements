@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Mandatory for Mac App Store distribution. Note: the sandbox denies
+	     nettop's network-statistics queries, so the App Store variant shows
+	     interface totals only (the app detects this and says so in the menu). -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+</dict>
+</plist>

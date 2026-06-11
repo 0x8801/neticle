@@ -1,0 +1,4 @@
+build/
+dist/
+Neticle.app/
+.DS_Store
