@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Network
 
 // System samplers and process actions. Everything here touches the OS;
 // the parsing/formatting logic lives in Core.swift where it's unit-tested.
@@ -74,7 +75,7 @@ final class NetworkRateSampler {
 ///   runs (its event loop is hot on busy systems), so it only runs while the
 ///   user is actually looking, like Activity Monitor.
 final class NettopMonitor {
-    let cadence: TimeInterval
+    private(set) var cadence: TimeInterval
     let streamInterval = 2
     private(set) var top: [ProcTraffic] = []
     /// Wall-clock seconds the current deltas cover.
@@ -122,6 +123,17 @@ final class NettopMonitor {
         timer?.invalidate()
         timer = nil
         endLiveStream()
+    }
+
+    func setCadence(_ seconds: TimeInterval) {
+        guard seconds != cadence else { return }
+        cadence = seconds
+        if timer != nil {
+            timer?.invalidate()
+            let t = Timer(timeInterval: cadence, repeats: true) { [weak self] _ in self?.tick() }
+            RunLoop.main.add(t, forMode: .common)
+            timer = t
+        }
     }
 
     // MARK: Live streaming (popover open)
@@ -451,6 +463,175 @@ final class DiskScanner {
                 self.onUpdate?()
             }
         }
+    }
+}
+
+// MARK: - Internet connectivity (path state + tiny latency probes)
+
+/// Non-invasive internet monitoring: NWPathMonitor reacts instantly when
+/// interfaces drop (zero traffic), and a periodic TCP handshake to 1.1.1.1
+/// measures real reachability + latency at a few packets per probe — no
+/// bandwidth-eating speed tests.
+final class ConnectivityMonitor {
+    struct Sample {
+        let at: Date
+        let latencyMs: Double?      // nil = offline at this sample
+    }
+    struct Outage {
+        let start: Date
+        var end: Date?
+    }
+
+    private(set) var online = true
+    private(set) var latencyMs: Double?
+    private(set) var history: [Sample] = []
+    private(set) var outages: [Outage] = []
+    private(set) var probeInterval: TimeInterval
+    var onUpdate: (() -> Void)?
+    /// Fires when connectivity returns after an outage (the public IP may
+    /// have changed, so the IP details should refresh).
+    var onReconnect: (() -> Void)?
+
+    private let host: String
+    private let pathMonitor = NWPathMonitor()
+    private var pathStarted = false
+    private var timer: Timer?
+    private var probing = false
+    private let historyCap = 120
+
+    init(probeInterval: TimeInterval = 30) {
+        self.probeInterval = probeInterval
+        // Overridable so QA can point probes at an unroutable address.
+        self.host = ProcessInfo.processInfo.environment["NETICLE_PROBE_HOST"] ?? "1.1.1.1"
+    }
+
+    func start() {
+        if !pathStarted {
+            pathStarted = true
+            pathMonitor.pathUpdateHandler = { [weak self] path in
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    if path.status != .satisfied {
+                        self.record(latency: nil)   // interface gone: offline now
+                    } else {
+                        self.probe()                // confirm + measure right away
+                    }
+                }
+            }
+            pathMonitor.start(queue: DispatchQueue(label: "neticle.path"))
+        }
+        scheduleTimer()
+        probe()
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    func setProbeInterval(_ seconds: TimeInterval) {
+        guard seconds != probeInterval else { return }
+        probeInterval = seconds
+        if timer != nil { scheduleTimer() }
+    }
+
+    private func scheduleTimer() {
+        timer?.invalidate()
+        let t = Timer(timeInterval: probeInterval, repeats: true) { [weak self] _ in self?.probe() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func probe() {
+        guard !probing else { return }
+        probing = true
+        let started = Date()
+        let connection = NWConnection(host: NWEndpoint.Host(host),
+                                      port: 443, using: .tcp)
+        var finished = false
+        let finish: (Double?) -> Void = { [weak self] latency in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !finished else { return }
+                finished = true
+                connection.cancel()
+                self.probing = false
+                self.record(latency: latency)
+            }
+        }
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                finish(Date().timeIntervalSince(started) * 1000)
+            case .failed, .cancelled:
+                finish(nil)
+            default:
+                break
+            }
+        }
+        connection.start(queue: DispatchQueue(label: "neticle.probe"))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(nil) }   // timeout
+    }
+
+    private func record(latency: Double?) {
+        let wasOnline = online
+        online = latency != nil
+        latencyMs = latency
+        history.append(Sample(at: Date(), latencyMs: latency))
+        if history.count > historyCap { history.removeFirst(history.count - historyCap) }
+        if wasOnline && !online {
+            outages.append(Outage(start: Date()))
+            if outages.count > 20 { outages.removeFirst() }
+        } else if !wasOnline && online {
+            if !outages.isEmpty && outages[outages.count - 1].end == nil {
+                outages[outages.count - 1].end = Date()
+            }
+            onReconnect?()
+        }
+        onUpdate?()
+    }
+}
+
+// MARK: - Public IP details
+
+final class IPInfoFetcher {
+    private(set) var details: IPDetails?
+    private(set) var fetching = false
+    var onUpdate: (() -> Void)?
+    private var lastFetch: Date?
+
+    /// ipwho.is primary, ipapi.co fallback — both free HTTPS endpoints.
+    func fetch(force: Bool = false) {
+        if !force, let last = lastFetch, Date().timeIntervalSince(last) < 60 { return }
+        guard !fetching else { return }
+        fetching = true
+        lastFetch = Date()
+        onUpdate?()
+        request(URL(string: "https://ipwho.is/")!, parse: parseIPWhoIs) { [weak self] details in
+            if let details {
+                self?.finish(details)
+            } else {
+                self?.request(URL(string: "https://ipapi.co/json/")!,
+                              parse: parseIPApiCo) { fallback in
+                    self?.finish(fallback)
+                }
+            }
+        }
+    }
+
+    private func request(_ url: URL, parse: @escaping (Data) -> IPDetails?,
+                         completion: @escaping (IPDetails?) -> Void) {
+        var req = URLRequest(url: url, timeoutInterval: 8)
+        req.setValue("neticle/0.2 (macOS menu bar)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            let details = data.flatMap(parse)
+            DispatchQueue.main.async { completion(details) }
+        }.resume()
+    }
+
+    private func finish(_ new: IPDetails?) {
+        fetching = false
+        if let new { details = new }
+        onUpdate?()
     }
 }
 

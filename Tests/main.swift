@@ -179,15 +179,64 @@ expect(onlyNet == [TitleSegment(symbol: "", text: "↓ 2.1 ↑ 0.3 Mbps")],
 expect(titlePlainText(onlyNet) == "↓ 2.1 ↑ 0.3 Mbps", "plain text network title")
 
 let all = titleSegments(pinned: Set(StatKind.allCases), downMbps: 1.0, upMbps: 0.5,
-                        cpuPercent: 23.4, memPercent: 61.8, diskPercent: 80.9)
-expect(all.count == 4, "all pins → 4 segments")
-expect(titlePlainText(all) == "↓ 1.0 ↑ 0.5 Mbps · CPU 23% · RAM 62% · DISK 81%",
+                        cpuPercent: 23.4, memPercent: 61.8, diskPercent: 80.9,
+                        online: true, latencyMs: 23)
+expect(all.count == 5, "all pins → 5 segments")
+expect(titlePlainText(all) == "↓ 1.0 ↑ 0.5 Mbps · CPU 23% · RAM 62% · DISK 81% · PING 23 ms",
        "plain text all-pinned title (got \(titlePlainText(all)))")
 
 let none = titleSegments(pinned: [], downMbps: 0, upMbps: 0,
                          cpuPercent: 0, memPercent: 0, diskPercent: 0)
 expect(none == [TitleSegment(symbol: "chart.bar.fill", text: "")], "no pins → logo only")
 expect(titlePlainText(none) == "Neticle", "plain text logo title")
+
+let gated = titleSegments(pinned: [.cpu, .network], enabled: [.network],
+                          downMbps: 2.0, upMbps: 0.1,
+                          cpuPercent: 50, memPercent: 0, diskPercent: 0)
+expect(titlePlainText(gated) == "↓ 2.0 ↑ 0.1 Mbps",
+       "disabled sections can't contribute pinned segments")
+
+let offline = titleSegments(pinned: [.internet], downMbps: 0, upMbps: 0,
+                            cpuPercent: 0, memPercent: 0, diskPercent: 0,
+                            online: false, latencyMs: nil)
+expect(titlePlainText(offline) == "PING offline", "offline shows in pinned title")
+
+// --- IP details parsing ---
+let whoIsFixture = """
+{"ip":"203.0.113.7","success":true,"city":"Nairobi","region":"Nairobi County",
+ "country":"Kenya","country_code":"KE","flag":{"emoji":"🇰🇪"},
+ "connection":{"asn":33771,"org":"Safaricom Ltd","isp":"Safaricom PLC"}}
+""".data(using: .utf8)!
+let whoIs = parseIPWhoIs(whoIsFixture)
+expect(whoIs == IPDetails(ip: "203.0.113.7", city: "Nairobi", country: "Kenya",
+                          countryCode: "KE", isp: "Safaricom PLC"),
+       "ipwho.is fixture parses")
+expect(parseIPWhoIs("{\"success\":false}".data(using: .utf8)!) == nil, "ipwho.is failure rejected")
+
+let apiCoFixture = """
+{"ip":"203.0.113.7","city":"Nairobi","region":"Nairobi","country_name":"Kenya",
+ "country_code":"KE","org":"SAFARICOM"}
+""".data(using: .utf8)!
+let apiCo = parseIPApiCo(apiCoFixture)
+expect(apiCo?.isp == "SAFARICOM" && apiCo?.country == "Kenya", "ipapi.co fixture parses")
+
+expect(flagEmoji("KE") == "🇰🇪", "flagEmoji KE")
+expect(flagEmoji("us") == "🇺🇸", "flagEmoji lowercase")
+expect(flagEmoji("") == "" && flagEmoji("K1") == "", "flagEmoji invalid input")
+
+// --- latency formatting + sparkline geometry ---
+expect(fmtLatency(nil) == "—" && fmtLatency(0.4) == "<1 ms" && fmtLatency(23.4) == "23 ms",
+       "fmtLatency variants")
+
+let spark = sparklineSegments([10, 20, nil, 40, 50], in: CGSize(width: 100, height: 40))
+expect(spark.lines.count == 2, "sparkline splits on offline gap (got \(spark.lines.count))")
+expect(spark.offlineXs.count == 1 && spark.offlineXs[0] == 50, "offline marker at gap x")
+expect(spark.lines[0].count == 2 && spark.lines[0][0].x == 0 && spark.lines[0][1].x == 25,
+       "sparkline x spacing even")
+expect(sparklineSegments([], in: CGSize(width: 100, height: 40)).lines.isEmpty,
+       "empty history → no lines")
+let flat = sparklineSegments([50, 50], in: CGSize(width: 100, height: 100))
+expect(flat.lines[0][0].y == 50, "y normalized against 100 ms floor")
 
 print(failures == 0 ? "\nALL TESTS PASSED" : "\n\(failures) TEST(S) FAILED")
 exit(failures == 0 ? 0 : 1)

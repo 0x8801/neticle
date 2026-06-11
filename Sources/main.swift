@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 
 // Neticle — menu bar system stats.
 // The status item shows whichever stats are pinned (network ↓/↑ Mbps by
@@ -34,6 +35,18 @@ struct AppState: Codable {
     let updatedAt: Double
     let title: String
     let pinned: [String]
+    let enabled: [String]
+    let psInterval: Double
+    let snapshotCadence: Double
+    let probeInterval: Double
+    let online: Bool
+    let latencyMs: Double?
+    let ip: String?
+    let ipCity: String?
+    let ipCountry: String?
+    let isp: String?
+    let outageCount: Int
+    let latencySamples: Int
     let downMbps: Double
     let upMbps: Double
     let windowSeconds: Double
@@ -65,6 +78,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private let store = StatsStore()
+    private let settings = Settings()
+    private var prefsWindow: NSWindow?
+    private var cancellables: Set<AnyCancellable> = []
+    private var slowTimer: Timer?
 
     private let rateSampler = NetworkRateSampler()
     // nettop's CSV one-shot takes a fixed ~5 s wall; a 6 s cadence avoids
@@ -73,6 +90,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     private let cpuSampler = CPUSampler()
     private let processSampler = ProcessListSampler()
     private let diskScanner = DiskScanner()
+    private let connectivity = ConnectivityMonitor()
+    private let ipFetcher = IPInfoFetcher()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -97,6 +116,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             self?.writeState()
         }
         store.requestRescan = { [weak self] in self?.diskScanner.rescan() }
+        store.requestIPRefresh = { [weak self] in self?.ipFetcher.fetch(force: true) }
+        store.openPreferences = { [weak self] in self?.showPreferences() }
 
         nettop.onUpdate = { [weak self] in
             guard let self else { return }
@@ -105,7 +126,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             self.store.nettopAvailable = !self.nettop.unavailable
             self.writeState()
         }
-        nettop.start()
+        if settings.enabledSections.contains(.network) {
+            nettop.start()
+        }
+
+        connectivity.onUpdate = { [weak self] in
+            guard let self else { return }
+            self.store.online = self.connectivity.online
+            self.store.latencyMs = self.connectivity.latencyMs
+            self.store.latencyHistory = self.connectivity.history.map(\.latencyMs)
+            self.store.outageText = Self.outageSummary(self.connectivity.outages)
+            self.renderTitle()
+            self.writeState()
+        }
+        connectivity.onReconnect = { [weak self] in self?.ipFetcher.fetch(force: true) }
+        ipFetcher.onUpdate = { [weak self] in
+            guard let self else { return }
+            self.store.ipDetails = self.ipFetcher.details
+            self.store.ipFetching = self.ipFetcher.fetching
+            self.writeState()
+        }
+        connectivity.setProbeInterval(settings.probeInterval)
+        if settings.enabledSections.contains(.internet) {
+            connectivity.start()
+            ipFetcher.fetch()
+        }
+        bindSettings()
 
         diskScanner.onUpdate = { [weak self] in
             guard let self else { return }
@@ -122,11 +168,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
 
         let fast = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.fastTick() }
         RunLoop.main.add(fast, forMode: .common)   // keep ticking while popover is open
-        let slow = Timer(timeInterval: 3.0, repeats: true) { [weak self] _ in self?.slowTick() }
-        RunLoop.main.add(slow, forMode: .common)
+        rescheduleSlowTimer()
         slowTick()
         renderTitle()
         installDebugSignals()
+    }
+
+    private func rescheduleSlowTimer() {
+        slowTimer?.invalidate()
+        let slow = Timer(timeInterval: settings.psInterval, repeats: true) { [weak self] _ in
+            self?.slowTick()
+        }
+        RunLoop.main.add(slow, forMode: .common)
+        slowTimer = slow
+    }
+
+    /// Live-applies preference changes: intervals reschedule their timers,
+    /// section toggles start/stop the corresponding samplers.
+    private func bindSettings() {
+        settings.$psInterval
+            .removeDuplicates()
+            .sink { [weak self] _ in DispatchQueue.main.async { self?.rescheduleSlowTimer() } }
+            .store(in: &cancellables)
+        settings.$snapshotCadence
+            .removeDuplicates()
+            .sink { [weak self] cadence in
+                DispatchQueue.main.async { self?.nettop.setCadence(cadence) }
+            }
+            .store(in: &cancellables)
+        settings.$probeInterval
+            .removeDuplicates()
+            .sink { [weak self] interval in
+                DispatchQueue.main.async { self?.connectivity.setProbeInterval(interval) }
+            }
+            .store(in: &cancellables)
+        settings.$enabledSections
+            .removeDuplicates()
+            .sink { [weak self] enabled in
+                DispatchQueue.main.async { self?.applySections(enabled) }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func applySections(_ enabled: Set<StatKind>) {
+        if enabled.contains(.network) {
+            nettop.start()
+            if popover.isShown { nettop.beginLiveStream() }
+        } else {
+            nettop.stop()
+        }
+        if enabled.contains(.internet) {
+            connectivity.start()
+            ipFetcher.fetch()
+        } else {
+            connectivity.stop()
+        }
+        renderTitle()
+        writeState()
     }
 
     /// Headless QA hooks: SIGUSR1 toggles the popover, SIGUSR2 toggles the
@@ -159,6 +257,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         if NSApp.currentEvent?.type == .rightMouseUp {
             let menu = NSMenu()
             menu.delegate = self
+            menu.addItem(withTitle: "Preferences…", action: #selector(showPrefsItem), keyEquivalent: ",")
+                .target = self
+            menu.addItem(.separator())
             menu.addItem(withTitle: "Quit Neticle", action: #selector(quit), keyEquivalent: "q")
                 .target = self
             // Attach the menu only for this click so left-clicks keep
@@ -170,7 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         if popover.isShown {
             popover.performClose(nil)
         } else if let button = statusItem.button {
-            let hosting = NSHostingController(rootView: StatsView(store: store))
+            let hosting = NSHostingController(rootView: StatsView(store: store, settings: settings))
             // Keep the popover a fixed size: NSHostingController's automatic
             // preferredContentSize updates make NSPopover re-anchor and glitch
             // whenever rows change, so they're disabled outright.
@@ -183,8 +284,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
             NSApp.activate(ignoringOtherApps: true)
-            nettop.beginLiveStream()    // fresh 2 s per-process data while visible
+            if settings.enabledSections.contains(.network) {
+                nettop.beginLiveStream()    // fresh 2 s per-process data while visible
+            }
         }
+    }
+
+    @objc private func showPrefsItem() {
+        showPreferences()
+    }
+
+    private func showPreferences() {
+        popover.performClose(nil)
+        if prefsWindow == nil {
+            let hosting = NSHostingController(rootView: PrefsView(settings: settings))
+            let window = NSWindow(contentViewController: hosting)
+            window.title = "Neticle Preferences"
+            window.styleMask = [.titled, .closable]
+            window.isReleasedWhenClosed = false
+            window.center()
+            prefsWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        prefsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    private static func outageSummary(_ outages: [ConnectivityMonitor.Outage]) -> String {
+        guard let last = outages.last else { return "none recorded yet" }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        let when = formatter.string(from: last.start)
+        let duration: String
+        if let end = last.end {
+            let seconds = Int(end.timeIntervalSince(last.start))
+            duration = seconds < 60 ? "\(max(seconds, 1)) s" : "\(seconds / 60) min"
+        } else {
+            duration = "ongoing"
+        }
+        return "\(outages.count) · last at \(when) (\(duration))"
     }
 
     func popoverDidClose(_ notification: Notification) {
@@ -200,9 +337,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         statusItem.menu = nil
     }
 
+    private func currentSegments() -> [TitleSegment] {
+        titleSegments(pinned: store.pinned,
+                      enabled: settings.enabledSections,
+                      downMbps: store.downMbps, upMbps: store.upMbps,
+                      cpuPercent: store.cpuPercent,
+                      memPercent: store.memPercent,
+                      diskPercent: store.diskPercent,
+                      online: store.online,
+                      latencyMs: store.latencyMs)
+    }
+
     private func renderTitle() {
         guard let button = statusItem.button else { return }
-        let segments = store.segments()
+        let segments = currentSegments()
         if segments.count == 1 && segments[0].symbol == "chart.bar.fill" {
             // Nothing pinned: show just the logo glyph.
             button.title = ""
@@ -227,15 +375,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
     }
 
     private func slowTick() {
-        if let cpu = cpuSampler.sample() {
+        let enabled = settings.enabledSections
+        if enabled.contains(.cpu), let cpu = cpuSampler.sample() {
             store.cpuPercent = cpu
         }
-        if let mem = sampleMemory() {
+        if enabled.contains(.memory), let mem = sampleMemory() {
             store.memory = mem
         }
-        if let disk = sampleDisk() {
+        if enabled.contains(.disk), let disk = sampleDisk() {
             store.disk = disk
         }
+        guard enabled.contains(.cpu) || enabled.contains(.memory) else { return }
         // Neticle's own footprint (the app plus its nettop/du helpers) is
         // hidden from the top lists — seeing the monitor's sampler ranked #1
         // confused more than it informed. Totals still include everything.
@@ -271,8 +421,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         let screen = itemWindow?.screen?.frame.size ?? .zero
         let state = AppState(
             updatedAt: Date().timeIntervalSince1970,
-            title: titlePlainText(store.segments()),
+            title: titlePlainText(currentSegments()),
             pinned: store.pinned.map(\.rawValue).sorted(),
+            enabled: settings.enabledSections.map(\.rawValue).sorted(),
+            psInterval: settings.psInterval,
+            snapshotCadence: settings.snapshotCadence,
+            probeInterval: settings.probeInterval,
+            online: store.online,
+            latencyMs: store.latencyMs,
+            ip: store.ipDetails?.ip,
+            ipCity: store.ipDetails?.city,
+            ipCountry: store.ipDetails?.country,
+            isp: store.ipDetails?.isp,
+            outageCount: connectivity.outages.count,
+            latencySamples: connectivity.history.count,
             downMbps: store.downMbps,
             upMbps: store.upMbps,
             windowSeconds: store.netWindow,

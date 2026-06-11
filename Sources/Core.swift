@@ -221,10 +221,87 @@ func fmtPercent(_ value: Double) -> String {
     String(format: "%.0f%%", min(max(value, 0), 999))
 }
 
+// MARK: - IP details (parsed from ipwho.is / ipapi.co JSON)
+
+struct IPDetails: Equatable {
+    let ip: String
+    let city: String
+    let country: String
+    let countryCode: String
+    let isp: String
+    var flag: String { flagEmoji(countryCode) }
+}
+
+func parseIPWhoIs(_ data: Data) -> IPDetails? {
+    guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          (json["success"] as? Bool) != false,
+          let ip = json["ip"] as? String, !ip.isEmpty else { return nil }
+    let connection = json["connection"] as? [String: Any]
+    return IPDetails(ip: ip,
+                     city: json["city"] as? String ?? "",
+                     country: json["country"] as? String ?? "",
+                     countryCode: json["country_code"] as? String ?? "",
+                     isp: (connection?["isp"] as? String)
+                        ?? (connection?["org"] as? String) ?? "")
+}
+
+func parseIPApiCo(_ data: Data) -> IPDetails? {
+    guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let ip = json["ip"] as? String, !ip.isEmpty else { return nil }
+    return IPDetails(ip: ip,
+                     city: json["city"] as? String ?? "",
+                     country: json["country_name"] as? String ?? "",
+                     countryCode: json["country_code"] as? String ?? "",
+                     isp: json["org"] as? String ?? "")
+}
+
+/// "KE" → 🇰🇪 via regional indicator symbols; empty/invalid → "".
+func flagEmoji(_ countryCode: String) -> String {
+    let code = countryCode.uppercased()
+    guard code.count == 2, code.allSatisfy({ $0.isLetter && $0.isASCII }) else { return "" }
+    return String(code.unicodeScalars.compactMap {
+        Unicode.Scalar(0x1F1E6 + $0.value - Unicode.Scalar("A").value).map(Character.init)
+    })
+}
+
+// MARK: - Connectivity history → sparkline geometry
+
+/// Latency history → line segments for a sparkline. `nil` samples (offline)
+/// split the line and are returned as x positions for offline markers.
+/// Y is normalized to max(observed, 100 ms) so quiet links don't look spiky.
+func sparklineSegments(_ values: [Double?], in size: CGSize)
+    -> (lines: [[CGPoint]], offlineXs: [CGFloat]) {
+    guard values.count > 1, size.width > 0, size.height > 0 else { return ([], []) }
+    let maxValue = max(values.compactMap { $0 }.max() ?? 100, 100)
+    let stepX = size.width / CGFloat(values.count - 1)
+    var lines: [[CGPoint]] = []
+    var current: [CGPoint] = []
+    var offlineXs: [CGFloat] = []
+    for (index, value) in values.enumerated() {
+        let x = CGFloat(index) * stepX
+        if let v = value {
+            let clamped = min(max(v, 0), maxValue)
+            let y = size.height - CGFloat(clamped / maxValue) * size.height
+            current.append(CGPoint(x: x, y: y))
+        } else {
+            offlineXs.append(x)
+            if current.count > 1 { lines.append(current) }
+            current = []
+        }
+    }
+    if current.count > 1 { lines.append(current) }
+    return (lines, offlineXs)
+}
+
+func fmtLatency(_ ms: Double?) -> String {
+    guard let ms else { return "—" }
+    return ms < 1 ? "<1 ms" : "\(Int(ms.rounded())) ms"
+}
+
 // MARK: - Pinned menu bar title
 
 enum StatKind: String, CaseIterable, Codable {
-    case network, cpu, memory, disk
+    case network, cpu, memory, disk, internet
 }
 
 struct TitleSegment: Equatable {
@@ -233,25 +310,34 @@ struct TitleSegment: Equatable {
 }
 
 /// Builds the menu bar segments for the pinned stats, in canonical order.
-/// With nothing pinned the bar shows just the Neticle glyph.
+/// Disabled sections can't contribute even if pinned. With nothing shown,
+/// the bar falls back to the Neticle glyph.
 func titleSegments(pinned: Set<StatKind>,
+                   enabled: Set<StatKind> = Set(StatKind.allCases),
                    downMbps: Double, upMbps: Double,
                    cpuPercent: Double,
                    memPercent: Double,
-                   diskPercent: Double) -> [TitleSegment] {
+                   diskPercent: Double,
+                   online: Bool = true,
+                   latencyMs: Double? = nil) -> [TitleSegment] {
+    let shown = pinned.intersection(enabled)
     var segments: [TitleSegment] = []
-    if pinned.contains(.network) {
+    if shown.contains(.network) {
         segments.append(TitleSegment(symbol: "",
                                      text: "↓ \(fmtMbps(downMbps)) ↑ \(fmtMbps(upMbps)) Mbps"))
     }
-    if pinned.contains(.cpu) {
+    if shown.contains(.cpu) {
         segments.append(TitleSegment(symbol: "cpu", text: fmtPercent(cpuPercent)))
     }
-    if pinned.contains(.memory) {
+    if shown.contains(.memory) {
         segments.append(TitleSegment(symbol: "memorychip", text: fmtPercent(memPercent)))
     }
-    if pinned.contains(.disk) {
+    if shown.contains(.disk) {
         segments.append(TitleSegment(symbol: "internaldrive", text: fmtPercent(diskPercent)))
+    }
+    if shown.contains(.internet) {
+        segments.append(TitleSegment(symbol: "wifi",
+                                     text: online ? fmtLatency(latencyMs) : "offline"))
     }
     if segments.isEmpty {
         segments.append(TitleSegment(symbol: "chart.bar.fill", text: ""))
@@ -266,6 +352,7 @@ func titlePlainText(_ segments: [TitleSegment]) -> String {
         case "cpu": return "CPU " + segment.text
         case "memorychip": return "RAM " + segment.text
         case "internaldrive": return "DISK " + segment.text
+        case "wifi": return "PING " + segment.text
         case "chart.bar.fill": return "Neticle"
         default: return segment.text
         }

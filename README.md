@@ -11,14 +11,22 @@ disk — each with a top-5 list and quick actions.
     in the background only cheap snapshots run.
   - **CPU** — total usage plus the top 5 processes.
   - **Memory** — used/total plus the top 5 processes by resident size.
+  - **Internet** — connection state (online/offline), a latency sparkline
+    from tiny TCP-handshake probes, your **public IP, location, and ISP**,
+    and an outage log. Deliberately non-invasive: no bandwidth-eating speed
+    tests, just a few packets per probe and instant offline detection via
+    `NWPathMonitor`.
   - **Disk** — used/total, plus an on-demand scan of your largest home
     folders (the scan never runs at launch — see Permissions below).
   - Hover a process row to **terminate** it (click the ✕ twice to confirm)
     or **view its recent logs** in Console. Hover a folder row to **reveal it
     in Finder** so you can clean things up.
   - The **pin** on each section toggles it into the menu bar title.
-- Right-click the menu bar item for Quit (or use the power button in the
-  popover, or ⌘Q while the right-click menu is open).
+- **Preferences** (gear in the popover, or right-click the menu bar item):
+  turn sections on/off (off also stops their sampling), tune refresh
+  intervals, and enable **launch at login** (macOS 13+).
+- Right-click the menu bar item for Preferences/Quit (or use the power
+  button in the popover).
 
 No Dock icon (`LSUIElement`). No special permissions needed. Universal
 binary (Apple Silicon + Intel), macOS 12+. Idle CPU is ~1%; while the
@@ -29,7 +37,7 @@ The network totals come from physical interface byte counters (`en*`,
 `pdp_ip*`, `ppp*`; tunnels like `utun` are excluded so VPNs don't
 double-count).
 
-## Permissions
+## Permissions & privacy
 
 Network, CPU, and memory stats need **no permissions**. The disk folder
 scan reads Desktop, Documents, Downloads, and app data — locations macOS
@@ -39,6 +47,14 @@ folders** in the popover, never at launch. macOS remembers what you allow
 (deny something and that folder is simply skipped). To skip the prompts
 entirely, grant Neticle **Full Disk Access** in System Settings → Privacy &
 Security.
+
+The Internet section makes two kinds of outbound requests, both only while
+that section is enabled: connectivity probes (a TCP handshake to
+`1.1.1.1:443`, a few packets each) and IP-details lookups against
+[ipwho.is](https://ipwho.is) with [ipapi.co](https://ipapi.co) as fallback —
+the lookup service necessarily sees your public IP (that's what it answers
+with). Nothing else leaves your machine; turn the section off in
+Preferences and no requests are made.
 
 ## Install (from a GitHub release)
 

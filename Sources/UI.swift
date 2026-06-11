@@ -24,6 +24,14 @@ final class StatsStore: ObservableObject {
     @Published var diskTop: [DirSize] = []
     @Published var scanState: DiskScanner.State = .idle
 
+    // Internet
+    @Published var online = true
+    @Published var latencyMs: Double?
+    @Published var latencyHistory: [Double?] = []
+    @Published var outageText = "none recorded yet"
+    @Published var ipDetails: IPDetails?
+    @Published var ipFetching = false
+
     // Kill-button arming (two-step confirm), keyed by pid so it survives
     // the periodic re-sorting of rows.
     @Published var armedKillPid: Int32?
@@ -38,6 +46,8 @@ final class StatsStore: ObservableObject {
     }
     var onPinnedChange: (() -> Void)?
     var requestRescan: (() -> Void)?
+    var requestIPRefresh: (() -> Void)?
+    var openPreferences: (() -> Void)?
 
     init() {
         if let saved = UserDefaults.standard.stringArray(forKey: "pinnedStats") {
@@ -66,17 +76,13 @@ final class StatsStore: ObservableObject {
 
     var memPercent: Double { memory?.percent ?? 0 }
     var diskPercent: Double { disk?.percent ?? 0 }
-
-    func segments() -> [TitleSegment] {
-        titleSegments(pinned: pinned, downMbps: downMbps, upMbps: upMbps,
-                      cpuPercent: cpuPercent, memPercent: memPercent, diskPercent: diskPercent)
-    }
 }
 
 // MARK: - Popover root
 
 struct StatsView: View {
     @ObservedObject var store: StatsStore
+    @ObservedObject var settings: Settings
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -84,10 +90,15 @@ struct StatsView: View {
             Divider().padding(.horizontal, 12)
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 14) {
-                    networkSection
-                    cpuSection
-                    memorySection
-                    diskSection
+                    if settings.enabledSections.contains(.network) { networkSection }
+                    if settings.enabledSections.contains(.internet) { internetSection }
+                    if settings.enabledSections.contains(.cpu) { cpuSection }
+                    if settings.enabledSections.contains(.memory) { memorySection }
+                    if settings.enabledSections.contains(.disk) { diskSection }
+                    if settings.enabledSections.isEmpty {
+                        NoticeRow(text: "All sections are turned off — see Preferences")
+                            .padding(.vertical, 30)
+                    }
                 }
                 .padding(12)
             }
@@ -113,6 +124,12 @@ struct StatsView: View {
             if let error = store.lastActionError {
                 Text(error).font(.caption2).foregroundColor(.red).lineLimit(1)
             }
+            Button { store.openPreferences?() } label: {
+                Image(systemName: "gearshape").font(.system(size: 12, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.secondary)
+            .help("Preferences")
             Button { NSApp.terminate(nil) } label: {
                 Image(systemName: "power").font(.system(size: 12, weight: .semibold))
             }
@@ -223,6 +240,65 @@ struct StatsView: View {
         }
     }
 
+    private var internetSection: some View {
+        Section1(kind: .internet, symbol: "wifi", tint: .blue,
+                 title: "Internet",
+                 value: store.online ? "Online · \(fmtLatency(store.latencyMs))" : "Offline",
+                 valueTint: store.online ? .green : .red,
+                 store: store,
+                 accessory: { AnyView(ipRefreshAccessory) }) {
+            VStack(alignment: .leading, spacing: 5) {
+                SparklineView(values: store.latencyHistory)
+                    .frame(height: 32)
+                HStack(spacing: 6) {
+                    Image(systemName: "number").font(.system(size: 10))
+                        .foregroundColor(.blue.opacity(0.8)).frame(width: 13)
+                    Text(store.ipDetails?.ip ?? (store.ipFetching ? "Looking up…" : "—"))
+                        .font(.system(size: 12).monospacedDigit())
+                    Spacer(minLength: 8)
+                    if let ip = store.ipDetails {
+                        Text("\(ip.flag) \([ip.city, ip.country].filter { !$0.isEmpty }.joined(separator: ", "))")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(height: 20)
+                HStack(spacing: 6) {
+                    Image(systemName: "antenna.radiowaves.left.and.right").font(.system(size: 10))
+                        .foregroundColor(.blue.opacity(0.8)).frame(width: 13)
+                    Text(store.ipDetails?.isp.isEmpty == false ? store.ipDetails!.isp : "—")
+                        .font(.system(size: 12)).lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text("ISP").font(.system(size: 10)).foregroundColor(.secondary)
+                }
+                .frame(height: 20)
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle").font(.system(size: 10))
+                        .foregroundColor(.orange.opacity(0.85)).frame(width: 13)
+                    Text("Outages: \(store.outageText)")
+                        .font(.system(size: 11)).foregroundColor(.secondary).lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .frame(height: 18)
+            }
+        }
+    }
+
+    private var ipRefreshAccessory: some View {
+        Button { store.requestIPRefresh?() } label: {
+            if store.ipFetching {
+                ProgressView().controlSize(.small).scaleEffect(0.6)
+            } else {
+                Image(systemName: "arrow.clockwise").font(.system(size: 10, weight: .semibold))
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundColor(.secondary)
+        .help("Refresh IP details")
+        .disabled(store.ipFetching)
+    }
+
     private var diskAccessory: some View {
         Button {
             store.requestRescan?()
@@ -248,19 +324,21 @@ private struct Section1<Rows: View>: View {
     let tint: Color
     let title: String
     let value: String
+    var valueTint: Color?
     var fraction: Double?
     @ObservedObject var store: StatsStore
     var accessory: (() -> AnyView)?
     @ViewBuilder let rows: Rows
 
     init(kind: StatKind, symbol: String, tint: Color, title: String, value: String,
-         fraction: Double? = nil, store: StatsStore,
+         valueTint: Color? = nil, fraction: Double? = nil, store: StatsStore,
          accessory: (() -> AnyView)? = nil, @ViewBuilder rows: () -> Rows) {
         self.kind = kind
         self.symbol = symbol
         self.tint = tint
         self.title = title
         self.value = value
+        self.valueTint = valueTint
         self.fraction = fraction
         self.store = store
         self.accessory = accessory
@@ -278,7 +356,7 @@ private struct Section1<Rows: View>: View {
                 Spacer()
                 Text(value)
                     .font(.system(size: 12, weight: .medium).monospacedDigit())
-                    .foregroundColor(.secondary)
+                    .foregroundColor(valueTint ?? .secondary)
                 PinButton(kind: kind, store: store)
             }
             if let fraction {
@@ -420,5 +498,104 @@ private struct NoticeRow: View {
             .foregroundColor(.secondary)
             .frame(maxWidth: .infinity, alignment: .center)
             .frame(height: 22)
+    }
+}
+
+// MARK: - Latency sparkline
+
+struct SparklineView: View {
+    let values: [Double?]
+
+    var body: some View {
+        GeometryReader { geo in
+            let inset = CGSize(width: geo.size.width - 8, height: geo.size.height - 8)
+            let plot = sparklineSegments(values, in: inset)
+            ZStack(alignment: .center) {
+                RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05))
+                if values.count < 2 {
+                    Text("Collecting latency samples…")
+                        .font(.system(size: 10)).foregroundColor(.secondary)
+                } else {
+                    ForEach(Array(plot.lines.enumerated()), id: \.offset) { _, line in
+                        Path { path in path.addLines(line) }
+                            .stroke(Color.blue.opacity(0.85),
+                                    style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                            .offset(x: 4, y: 4)
+                    }
+                    ForEach(Array(plot.offlineXs.enumerated()), id: \.offset) { _, x in
+                        Path { path in
+                            path.move(to: CGPoint(x: x, y: 0))
+                            path.addLine(to: CGPoint(x: x, y: inset.height))
+                        }
+                        .stroke(Color.red.opacity(0.55), lineWidth: 1.5)
+                        .offset(x: 4, y: 4)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Preferences
+
+struct PrefsView: View {
+    @ObservedObject var settings: Settings
+
+    private static let sectionNames: [(StatKind, String)] = [
+        (.network, "Network"), (.internet, "Internet"), (.cpu, "CPU"),
+        (.memory, "Memory"), (.disk, "Disk"),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Sections").font(.headline)
+            ForEach(Self.sectionNames, id: \.0) { kind, name in
+                Toggle(name, isOn: sectionBinding(kind))
+            }
+            Text("Hiding a section also stops its sampling. Pinned stats of hidden sections leave the menu bar.")
+                .font(.caption2).foregroundColor(.secondary)
+
+            Divider()
+
+            Text("Refresh intervals").font(.headline)
+            intervalRow("Processes (CPU & memory)", $settings.psInterval, [1, 2, 3, 5, 10])
+            intervalRow("Network per-process snapshots", $settings.snapshotCadence, [6, 10, 15, 30])
+            intervalRow("Connectivity probe", $settings.probeInterval, [10, 30, 60, 120])
+
+            Divider()
+
+            Toggle("Launch Neticle at login", isOn: loginBinding)
+                .disabled(!Settings.loginItemSupported)
+            if !Settings.loginItemSupported {
+                Text("Requires macOS 13 or newer.")
+                    .font(.caption2).foregroundColor(.secondary)
+            } else if let error = settings.launchAtLoginError {
+                Text(error).font(.caption2).foregroundColor(.red)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+
+    private func intervalRow(_ label: String, _ value: Binding<Double>, _ choices: [Double]) -> some View {
+        HStack {
+            Text(label).font(.system(size: 12))
+            Spacer()
+            Picker("", selection: value) {
+                ForEach(choices, id: \.self) { Text("\(Int($0)) s").tag($0) }
+            }
+            .labelsHidden()
+            .frame(width: 80)
+        }
+    }
+
+    private func sectionBinding(_ kind: StatKind) -> Binding<Bool> {
+        Binding(get: { settings.enabledSections.contains(kind) },
+                set: { _ in settings.toggleSection(kind) })
+    }
+
+    private var loginBinding: Binding<Bool> {
+        Binding(get: { settings.launchAtLogin },
+                set: { settings.applyLaunchAtLogin($0) })
     }
 }
