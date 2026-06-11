@@ -1,180 +1,55 @@
 import AppKit
+import SwiftUI
 
-// Neticle — menu bar network throughput meter.
-// Shows live ↓/↑ Mbps in the status bar; the menu lists the top 5 processes
-// by current network usage (sampled from `nettop`). Mirrors its state to
-// /tmp/neticle-state.json so the behaviour can be verified from the CLI.
+// Neticle — menu bar system stats.
+// The status item shows whichever stats are pinned (network ↓/↑ Mbps by
+// default); clicking it opens a SwiftUI popover with Network, CPU, Memory,
+// and Disk sections, each with a top-5 list and row actions (terminate,
+// view logs, reveal in Finder). State is mirrored to a JSON file so
+// behaviour can be verified from the CLI.
 
 // Overridable because the sandboxed (App Store) variant cannot write /tmp;
 // QA scripts point this at a container path instead.
 let statePath = ProcessInfo.processInfo.environment["NETICLE_STATE"] ?? "/tmp/neticle-state.json"
 
-// MARK: - Total throughput via per-interface byte counters
-
-final class NetworkRateSampler {
-    struct Rate {
-        let downBytesPerSec: Double
-        let upBytesPerSec: Double
-    }
-
-    private var previous: [String: (rx: UInt32, tx: UInt32)] = [:]
-    private var previousAt: Date?
-
-    func sample() -> Rate? {
-        let now = Date()
-        let current = Self.readCounters()
-        let last = previous
-        let lastAt = previousAt
-        previous = current
-        previousAt = now
-        guard let lastAt, !last.isEmpty else { return nil }
-        let dt = now.timeIntervalSince(lastAt)
-        guard dt > 0.2 else { return nil }
-        var dRx: UInt64 = 0
-        var dTx: UInt64 = 0
-        for (name, cur) in current {
-            guard let prev = last[name] else { continue }
-            dRx &+= UInt64(cur.rx &- prev.rx)   // &- absorbs 32-bit counter wrap
-            dTx &+= UInt64(cur.tx &- prev.tx)
-        }
-        return Rate(downBytesPerSec: Double(dRx) / dt, upBytesPerSec: Double(dTx) / dt)
-    }
-
-    // en* = Wi-Fi/Ethernet, pdp_ip* = cellular, ppp* = legacy VPN/dial.
-    // utun/awdl/llw/lo are skipped so VPN tunnels don't double-count traffic.
-    private static func isCounted(_ name: String) -> Bool {
-        name.hasPrefix("en") || name.hasPrefix("pdp_ip") || name.hasPrefix("ppp")
-    }
-
-    private static func readCounters() -> [String: (rx: UInt32, tx: UInt32)] {
-        var result: [String: (rx: UInt32, tx: UInt32)] = [:]
-        var addrs: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&addrs) == 0 else { return result }
-        defer { freeifaddrs(addrs) }
-        var cursor = addrs
-        while let entry = cursor {
-            defer { cursor = entry.pointee.ifa_next }
-            guard let sa = entry.pointee.ifa_addr,
-                  sa.pointee.sa_family == UInt8(AF_LINK),
-                  let raw = entry.pointee.ifa_data else { continue }
-            let name = String(cString: entry.pointee.ifa_name)
-            guard isCounted(name) else { continue }
-            let data = raw.assumingMemoryBound(to: if_data.self).pointee
-            result[name] = (rx: data.ifi_ibytes, tx: data.ifi_obytes)
-        }
-        return result
-    }
-}
-
-// MARK: - Per-process usage via a long-running nettop stream
-
-final class NettopMonitor {
-    let interval: Double
-    private(set) var top: [ProcTraffic] = []
-    /// True when nettop can't run or never produces data (e.g. under the App
-    /// Sandbox, which denies the PTY and the network-statistics queries).
-    private(set) var unavailable = false
-    var onUpdate: (() -> Void)?
-
-    private var parser = NettopStreamParser()
-    private var process: Process?
-    private var stopped = false
-    private var hasEverEmitted = false
-    private var failedLaunches = 0
-
-    init(interval: Double) {
-        self.interval = interval
-    }
-
-    func start() { launch() }
-
-    func stop() {
-        stopped = true
-        process?.terminate()
-    }
-
-    private func launch() {
-        guard !stopped else { return }
-        let p = Process()
-        // nettop block-buffers stdout when writing to a pipe, which would make
-        // samples arrive in multi-second bursts. `script -q /dev/null` gives it
-        // a PTY so every sample flushes immediately.
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/script")
-        p.arguments = ["-q", "/dev/null",
-                       "/usr/bin/nettop", "-P", "-d", "-x", "-J", "bytes_in,bytes_out",
-                       "-s", String(Int(interval)), "-L", "0"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if data.isEmpty {                      // EOF
-                handle.readabilityHandler = nil
-                return
-            }
-            guard let text = String(data: data, encoding: .utf8) else { return }
-            // .common keeps updates flowing while the status menu is open.
-            RunLoop.main.perform(inModes: [.common]) { [weak self] in
-                self?.ingest(text)
-            }
-            CFRunLoopWakeUp(CFRunLoopGetMain())
-        }
-        p.terminationHandler = { [weak self] _ in
-            DispatchQueue.main.async { [weak self] in
-                guard let self, !self.stopped else { return }
-                self.failedLaunches += 1
-                if !self.hasEverEmitted && self.failedLaunches >= 3 {
-                    self.markUnavailable()         // keeps dying without data: give up
-                    return
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                    self?.launch()                 // restart if nettop dies on us
-                }
-            }
-        }
-        do {
-            try p.run()
-            process = p
-        } catch {
-            NSLog("Neticle: failed to launch nettop: \(error)")
-            DispatchQueue.main.async { [weak self] in self?.markUnavailable() }
-        }
-    }
-
-    private func markUnavailable() {
-        guard !unavailable else { return }
-        unavailable = true
-        top = []
-        onUpdate?()
-    }
-
-    private func ingest(_ text: String) {
-        for block in parser.feed(text) {
-            hasEverEmitted = true
-            failedLaunches = 0
-            top = Array(block.filter { $0.total > 0 }.prefix(5))
-            onUpdate?()
-        }
-    }
-}
-
 // MARK: - State mirror for CLI verification
 
 struct AppState: Codable {
-    struct Entry: Codable {
+    struct NetEntry: Codable {
         let name: String
         let pid: Int32
         let downMbps: Double
         let upMbps: Double
     }
+    struct ProcEntry: Codable {
+        let name: String
+        let pid: Int32
+        let cpuPercent: Double
+        let rssBytes: UInt64
+    }
+    struct DirEntry: Codable {
+        let path: String
+        let bytes: UInt64
+    }
     let updatedAt: Double
     let title: String
+    let pinned: [String]
     let downMbps: Double
     let upMbps: Double
     let windowSeconds: Double
-    let top: [Entry]
+    let top: [NetEntry]
     let menuLines: [String]
     let nettopAvailable: Bool
+    let liveStream: Bool
+    let cpuPercent: Double
+    let cpuTop: [ProcEntry]
+    let memUsedBytes: UInt64
+    let memTotalBytes: UInt64
+    let memTop: [ProcEntry]
+    let diskUsedBytes: UInt64
+    let diskTotalBytes: UInt64
+    let diskTop: [DirEntry]
+    let diskScan: String
     // Status item geometry as reported by AppKit — lets CLI QA confirm the
     // item really occupies a menu bar slot without screen-capture permissions.
     let itemVisible: Bool
@@ -184,136 +59,220 @@ struct AppState: Codable {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
-    private let rateSampler = NetworkRateSampler()
-    private let monitor = NettopMonitor(interval: 2)
-    private var downMbps = 0.0
-    private var upMbps = 0.0
+    private let popover = NSPopover()
+    private let store = StatsStore()
 
-    private let menu = NSMenu()
-    private let totalsItem = NSMenuItem()
-    private let sectionItem = NSMenuItem()
-    private var rowItems: [NSMenuItem] = []
+    private let rateSampler = NetworkRateSampler()
+    // nettop's CSV one-shot takes a fixed ~5 s wall; a 6 s cadence avoids
+    // overlapping runs so every snapshot lands and windows stay uniform.
+    private let nettop = NettopMonitor(cadence: 6)
+    private let cpuSampler = CPUSampler()
+    private let processSampler = ProcessListSampler()
+    private let diskScanner = DiskScanner()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-            button.title = statusTitle(downMbps: 0, upMbps: 0)
-            button.toolTip = "Neticle — live network throughput. Click for top consumers."
+            button.toolTip = "Neticle — click for system stats"
+            button.target = self
+            button.action = #selector(statusClicked)
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
-        buildMenu()
-        statusItem.menu = menu
+
+        popover.behavior = .transient
+        popover.animates = false
+        popover.delegate = self
+        // Content is created lazily on open and torn down on close: a live
+        // NSHostingView re-renders on every published sample even while the
+        // popover is hidden, which costs real CPU in a 1 s-tick app.
+
+        store.onPinnedChange = { [weak self] in
+            self?.renderTitle()
+            self?.writeState()
+        }
+        store.requestRescan = { [weak self] in self?.diskScanner.rescan() }
+
+        nettop.onUpdate = { [weak self] in
+            guard let self else { return }
+            self.store.netTop = self.nettop.top
+            self.store.netWindow = self.nettop.window
+            self.store.nettopAvailable = !self.nettop.unavailable
+            self.writeState()
+        }
+        nettop.start()
+
+        diskScanner.onUpdate = { [weak self] in
+            guard let self else { return }
+            self.store.diskTop = self.diskScanner.top
+            self.store.scanState = self.diskScanner.state
+            self.writeState()
+        }
+        diskScanner.rescan()
 
         _ = rateSampler.sample()                   // prime the counters
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.tick()
-        }
-        RunLoop.main.add(timer, forMode: .common)  // keep ticking while menu is open
+        _ = cpuSampler.sample()
 
-        monitor.onUpdate = { [weak self] in self?.refreshRows() }
-        monitor.start()
+        let fast = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.fastTick() }
+        RunLoop.main.add(fast, forMode: .common)   // keep ticking while popover is open
+        let slow = Timer(timeInterval: 3.0, repeats: true) { [weak self] _ in self?.slowTick() }
+        RunLoop.main.add(slow, forMode: .common)
+        slowTick()
+        renderTitle()
+        installDebugSignals()
+    }
+
+    /// Headless QA hooks: SIGUSR1 toggles the popover, SIGUSR2 toggles the
+    /// live nettop stream without UI involvement.
+    private var signalSources: [DispatchSourceSignal] = []
+    private func installDebugSignals() {
+        for (sig, handler) in [(SIGUSR1, { [weak self] in self?.statusClicked() }),
+                               (SIGUSR2, { [weak self] in
+                                   guard let self else { return }
+                                   self.nettop.isStreaming
+                                       ? self.nettop.endLiveStream()
+                                       : self.nettop.beginLiveStream()
+                               })] as [(Int32, () -> Void)] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler(handler: handler)
+            source.resume()
+            signalSources.append(source)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        monitor.stop()
+        nettop.stop()
+        diskScanner.cancel()
     }
 
-    private func buildMenu() {
-        menu.autoenablesItems = false
-        totalsItem.isEnabled = false
-        menu.addItem(totalsItem)
-        menu.addItem(.separator())
-        sectionItem.isEnabled = false
-        menu.addItem(sectionItem)
-        for _ in 0..<5 {
-            let item = NSMenuItem()
-            item.isEnabled = true                  // full-contrast text; click is a no-op
-            item.isHidden = true
-            rowItems.append(item)
-            menu.addItem(item)
+    // MARK: Status item
+
+    @objc private func statusClicked() {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            let menu = NSMenu()
+            menu.delegate = self
+            menu.addItem(withTitle: "Quit Neticle", action: #selector(quit), keyEquivalent: "q")
+                .target = self
+            // Attach the menu only for this click so left-clicks keep
+            // toggling the popover; menuDidClose detaches it again.
+            statusItem.menu = menu
+            statusItem.button?.performClick(nil)
+            return
         }
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit Neticle", action: #selector(quit(_:)), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
-        renderTotals()
-        refreshRows()
+        if popover.isShown {
+            popover.performClose(nil)
+        } else if let button = statusItem.button {
+            popover.contentViewController = NSHostingController(rootView: StatsView(store: store))
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+            NSApp.activate(ignoringOtherApps: true)
+            nettop.beginLiveStream()    // fresh 2 s per-process data while visible
+        }
     }
 
-    @objc private func quit(_ sender: Any?) {
+    func popoverDidClose(_ notification: Notification) {
+        popover.contentViewController = nil
+        nettop.endLiveStream()
+    }
+
+    @objc private func quit() {
         NSApp.terminate(nil)
     }
 
-    private func tick() {
+    func menuDidClose(_ menu: NSMenu) {
+        statusItem.menu = nil
+    }
+
+    private func renderTitle() {
+        guard let button = statusItem.button else { return }
+        let segments = store.segments()
+        if segments.count == 1 && segments[0].symbol == "chart.bar.fill" {
+            // Nothing pinned: show just the logo glyph.
+            button.title = ""
+            button.image = NSImage(systemSymbolName: "chart.bar.fill",
+                                   accessibilityDescription: "Neticle")
+            button.image?.isTemplate = true
+        } else {
+            button.image = nil
+            button.title = titlePlainText(segments)
+        }
+    }
+
+    // MARK: Sampling ticks
+
+    private func fastTick() {
         if let rate = rateSampler.sample() {
-            downMbps = rate.downBytesPerSec * 8.0 / 1_000_000.0
-            upMbps = rate.upBytesPerSec * 8.0 / 1_000_000.0
+            store.downMbps = rate.downBytesPerSec * 8.0 / 1_000_000.0
+            store.upMbps = rate.upBytesPerSec * 8.0 / 1_000_000.0
         }
-        statusItem.button?.title = statusTitle(downMbps: downMbps, upMbps: upMbps)
-        renderTotals()
+        renderTitle()
         writeState()
     }
 
-    private func renderTotals() {
-        totalsItem.attributedTitle = NSAttributedString(
-            string: totalsLine(downMbps: downMbps, upMbps: upMbps),
-            attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold),
-                .foregroundColor: NSColor.labelColor,
-            ])
-        sectionItem.attributedTitle = NSAttributedString(
-            string: "TOP CONSUMERS — Mbps, last \(Int(monitor.interval)) s",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ])
-    }
-
-    private func currentMenuLines() -> [String] {
-        monitor.unavailable
-            ? ["Per-process stats unavailable in this build"]
-            : consumerLines(monitor.top, interval: monitor.interval)
-    }
-
-    private func refreshRows() {
-        let lines = currentMenuLines()
-        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        for (index, item) in rowItems.enumerated() {
-            if index < lines.count {
-                item.attributedTitle = NSAttributedString(
-                    string: lines[index],
-                    attributes: [.font: font, .foregroundColor: NSColor.labelColor])
-                item.isHidden = false
-            } else {
-                item.isHidden = true
-            }
+    private func slowTick() {
+        if let cpu = cpuSampler.sample() {
+            store.cpuPercent = cpu
         }
-        writeState()
+        if let mem = sampleMemory() {
+            store.memory = mem
+        }
+        if let disk = sampleDisk() {
+            store.disk = disk
+        }
+        processSampler.sample { [weak self] procs in
+            guard let self else { return }
+            self.store.cpuTop = topByCPU(procs)
+            self.store.memTop = topByMemory(procs)
+        }
     }
+
+    // MARK: State mirror
 
     private func writeState() {
-        let entries = monitor.top.map {
-            AppState.Entry(name: $0.name,
-                           pid: $0.pid,
-                           downMbps: mbps($0.bytesIn, over: monitor.interval),
-                           upMbps: mbps($0.bytesOut, over: monitor.interval))
+        let netEntries = store.netTop.map {
+            AppState.NetEntry(name: $0.name, pid: $0.pid,
+                              downMbps: mbps($0.bytesIn, over: store.netWindow),
+                              upMbps: mbps($0.bytesOut, over: store.netWindow))
+        }
+        let scanLabel: String
+        switch store.scanState {
+        case .idle: scanLabel = "idle"
+        case .scanning: scanLabel = "scanning"
+        case .done: scanLabel = "done"
         }
         let itemWindow = statusItem?.button?.window
         let frame = itemWindow?.frame ?? .zero
         let screen = itemWindow?.screen?.frame.size ?? .zero
-        let state = AppState(updatedAt: Date().timeIntervalSince1970,
-                             title: statusItem?.button?.title ?? "",
-                             downMbps: downMbps,
-                             upMbps: upMbps,
-                             windowSeconds: monitor.interval,
-                             top: entries,
-                             menuLines: currentMenuLines(),
-                             nettopAvailable: !monitor.unavailable,
-                             itemVisible: statusItem?.isVisible ?? false,
-                             itemFrame: [frame.origin.x, frame.origin.y, frame.width, frame.height],
-                             screenSize: [screen.width, screen.height])
+        let state = AppState(
+            updatedAt: Date().timeIntervalSince1970,
+            title: titlePlainText(store.segments()),
+            pinned: store.pinned.map(\.rawValue).sorted(),
+            downMbps: store.downMbps,
+            upMbps: store.upMbps,
+            windowSeconds: store.netWindow,
+            top: netEntries,
+            menuLines: store.nettopAvailable
+                ? consumerLines(store.netTop, interval: store.netWindow)
+                : ["Per-process stats unavailable in this build"],
+            nettopAvailable: store.nettopAvailable,
+            liveStream: nettop.isStreaming,
+            cpuPercent: store.cpuPercent,
+            cpuTop: store.cpuTop.map { AppState.ProcEntry(name: $0.name, pid: $0.pid,
+                                                          cpuPercent: $0.cpuPercent, rssBytes: $0.rssBytes) },
+            memUsedBytes: store.memory?.usedBytes ?? 0,
+            memTotalBytes: store.memory?.totalBytes ?? 0,
+            memTop: store.memTop.map { AppState.ProcEntry(name: $0.name, pid: $0.pid,
+                                                          cpuPercent: $0.cpuPercent, rssBytes: $0.rssBytes) },
+            diskUsedBytes: store.disk?.usedBytes ?? 0,
+            diskTotalBytes: store.disk?.totalBytes ?? 0,
+            diskTop: store.diskTop.map { AppState.DirEntry(path: $0.path, bytes: $0.bytes) },
+            diskScan: scanLabel,
+            itemVisible: statusItem?.isVisible ?? false,
+            itemFrame: [frame.origin.x, frame.origin.y, frame.width, frame.height],
+            screenSize: [screen.width, screen.height])
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? encoder.encode(state) {

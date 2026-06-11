@@ -24,8 +24,8 @@ mkdir -p build dist
 rm -rf dist/appstore && mkdir -p dist/appstore
 
 echo "• compiling universal binary…"
-swiftc -O -target arm64-apple-macos12  -o build/Neticle-arm64  Sources/Core.swift Sources/main.swift
-swiftc -O -target x86_64-apple-macos12 -o build/Neticle-x86_64 Sources/Core.swift Sources/main.swift
+swiftc -O -target arm64-apple-macos12  -o build/Neticle-arm64  Sources/*.swift
+swiftc -O -target x86_64-apple-macos12 -o build/Neticle-x86_64 Sources/*.swift
 lipo -create -output build/Neticle-universal build/Neticle-arm64 build/Neticle-x86_64
 
 APP="dist/appstore/Neticle.app"

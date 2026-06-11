@@ -1,13 +1,13 @@
 # Distributing Neticle
 
-Two channels are supported. Per-process stats (the top-5 menu) need
-`nettop`'s network-statistics queries, which the Mac App Store sandbox
-denies — so the channels differ in functionality:
+Two channels are supported. The per-process features (top-5 lists, kill,
+logs) and the home-folder disk scan need OS queries that the Mac App Store
+sandbox denies — so the channels differ in functionality:
 
-| Channel | Headline ↓/↑ Mbps | Top-5 consumers | Script |
-|---|---|---|---|
-| GitHub release (direct download) | ✅ | ✅ | `scripts/package-release.sh` |
-| Mac App Store (sandboxed) | ✅ | ❌ shows a notice | `scripts/build-appstore.sh` |
+| Channel | Totals (net/CPU/RAM/disk) | Top-5 lists & actions | Folder scan | Script |
+|---|---|---|---|---|
+| GitHub release (direct download) | ✅ | ✅ | ✅ | `scripts/package-release.sh` |
+| Mac App Store (sandboxed) | ✅ | ❌ shows a notice | ✅ (metadata reads are allowed) | `scripts/build-appstore.sh` |
 
 Both scripts build a universal (arm64 + x86_64) binary, minimum macOS 12.
 
@@ -49,8 +49,9 @@ What's already prepared in this repo:
 - `Resources/Neticle-AppStore.entitlements` — App Sandbox entitlement (mandatory for MAS).
 - `Resources/Info.plist` — bundle id `com.egithinji.neticle`, version,
   category (`public.app-category.utilities`), icon, encryption exemption.
-- The app detects the sandbox at runtime (nettop can't run) and shows
-  "Per-process stats unavailable in this build" instead of an empty menu —
+- The app degrades gracefully under the sandbox (nettop/ps produce no
+  per-process data): the affected sections show an "unavailable" notice
+  instead of an empty list, while totals and the folder scan keep working —
   verified locally by running the sandboxed build.
 - `scripts/build-appstore.sh` — builds, signs, and produces the installer pkg.
 

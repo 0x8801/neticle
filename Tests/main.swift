@@ -104,5 +104,90 @@ expect(lines.count == 1 && lines[0].hasPrefix("1. curl") && lines[0].contains("�
        "consumer line renders rates (got \(lines.first ?? "nil"))")
 expect(consumerLines([], interval: 2) == ["No measurable traffic yet…"], "empty top renders placeholder")
 
+// --- one-shot snapshot parsing + diffing ---
+let snap1 = parseNettopSnapshot("""
+time,,bytes_in,bytes_out,
+11:56:50.309465,launchd.1,100,200,
+11:56:50.309466,curl.42,5000,300,
+""")
+expect(snap1.count == 2, "snapshot parses rows, skips header (got \(snap1.count))")
+
+let snap2 = parseNettopSnapshot("""
+time,,bytes_in,bytes_out,
+11:56:53.000000,launchd.1,150,260,
+11:56:53.000001,curl.42,905000,1300,
+11:56:53.000002,Spotify.7,10,20,
+""")
+var prevMap: [String: ProcTraffic] = [:]
+for r in snap1 { prevMap[snapshotKey(r)] = r }
+var curMap: [String: ProcTraffic] = [:]
+for r in snap2 { curMap[snapshotKey(r)] = r }
+let deltas = diffSnapshots(previous: prevMap, current: curMap)
+expect(deltas.count == 2, "first-seen processes skipped in diff (got \(deltas.count))")
+let curlDelta = deltas.first { $0.name == "curl" }
+expect(curlDelta?.bytesIn == 900_000 && curlDelta?.bytesOut == 1000, "diff computes byte deltas")
+
+let restarted = diffSnapshots(
+    previous: ["42|x": ProcTraffic(name: "x", pid: 42, bytesIn: 9999, bytesOut: 9999)],
+    current: ["42|x": ProcTraffic(name: "x", pid: 42, bytesIn: 5, bytesOut: 7)])
+expect(restarted.first?.bytesIn == 0 && restarted.first?.bytesOut == 0,
+       "backwards counters clamp to zero (pid reuse)")
+
+// --- ps parsing (CPU / memory top lists) ---
+let psOutput = """
+  0.0  1234   1 launchd
+ 12.5 524288  4142 Google Chrome Helper (Renderer)
+  3.2 131072   999 WindowServer
+ 99.9 2048  4321 yes
+"""
+let procs = parsePsRows(psOutput)
+expect(procs.count == 4, "ps rows parsed (got \(procs.count))")
+expect(procs[1].name == "Google Chrome Helper (Renderer)" && procs[1].pid == 4142,
+       "ps comm with spaces survives")
+expect(procs[1].rssBytes == 524_288 * 1024, "ps rss is KB → bytes")
+expect(topByCPU(procs).first?.name == "yes", "topByCPU sorts by pcpu")
+expect(topByMemory(procs).first?.name == "Google Chrome Helper (Renderer)", "topByMemory sorts by rss")
+expect(parsePsRows("garbage line\n").isEmpty, "ps garbage rejected")
+
+// --- du parsing (largest folders) ---
+let duOutput = """
+1048576\t/Users/x/Movies
+2097152\t/Users/x/Library/Caches
+512\t/Users/x/.hidden
+4194304\t/Users/x
+8192\t/Users/x/Library
+524288\t/Users/x/Downloads
+"""
+let dirs = parseDuRows(duOutput, roots: ["/Users/x", "/Users/x/Library"])
+expect(dirs.count == 3, "du roots and hidden dirs dropped (got \(dirs.count))")
+expect(dirs.first?.path == "/Users/x/Library/Caches" && dirs.first?.bytes == 2_097_152 * 1024,
+       "du sorted desc, KB → bytes")
+expect(dirs.first?.displayName == "Caches", "du display name is last component")
+
+// --- human formatting ---
+expect(bytesHuman(512 * 1024) == "512 KB", "bytesHuman KB")
+expect(bytesHuman(200 * 1_048_576) == "200 MB", "bytesHuman MB")
+expect(bytesHuman(UInt64(2.5 * 1_073_741_824)) == "2.5 GB", "bytesHuman GB")
+expect(bytesHuman(250 * 1_073_741_824) == "250 GB", "bytesHuman big GB drops decimals")
+expect(fmtPercent(23.4) == "23%", "fmtPercent rounds")
+
+// --- pinned menu bar title ---
+let onlyNet = titleSegments(pinned: [.network], downMbps: 2.1, upMbps: 0.3,
+                            cpuPercent: 50, memPercent: 60, diskPercent: 70)
+expect(onlyNet == [TitleSegment(symbol: "", text: "↓ 2.1 ↑ 0.3 Mbps")],
+       "network-only pin keeps classic title")
+expect(titlePlainText(onlyNet) == "↓ 2.1 ↑ 0.3 Mbps", "plain text network title")
+
+let all = titleSegments(pinned: Set(StatKind.allCases), downMbps: 1.0, upMbps: 0.5,
+                        cpuPercent: 23.4, memPercent: 61.8, diskPercent: 80.9)
+expect(all.count == 4, "all pins → 4 segments")
+expect(titlePlainText(all) == "↓ 1.0 ↑ 0.5 Mbps · CPU 23% · RAM 62% · DISK 81%",
+       "plain text all-pinned title (got \(titlePlainText(all)))")
+
+let none = titleSegments(pinned: [], downMbps: 0, upMbps: 0,
+                         cpuPercent: 0, memPercent: 0, diskPercent: 0)
+expect(none == [TitleSegment(symbol: "chart.bar.fill", text: "")], "no pins → logo only")
+expect(titlePlainText(none) == "Neticle", "plain text logo title")
+
 print(failures == 0 ? "\nALL TESTS PASSED" : "\n\(failures) TEST(S) FAILED")
 exit(failures == 0 ? 0 : 1)

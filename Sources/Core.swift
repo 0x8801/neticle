@@ -124,3 +124,150 @@ func consumerLines(_ top: [ProcTraffic], interval: Double, maxRows: Int = 5) -> 
         return "\(index + 1). \(rpad(p.name, 17)) ↓\(down)  ↑\(up)"
     }
 }
+
+/// Rows of a single one-shot snapshot (`nettop -P -x -J bytes_in,bytes_out -L 1`):
+/// cumulative per-process byte counters. Streaming nettop (-L 0) burns >100%
+/// CPU in its event loop, so the app takes cheap snapshots and diffs them.
+func parseNettopSnapshot(_ text: String) -> [ProcTraffic] {
+    text.split(whereSeparator: \.isNewline).compactMap { line in
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed.hasPrefix("time,") { return nil }
+        return NettopStreamParser.parseRow(trimmed)
+    }
+}
+
+/// Per-process byte deltas between two snapshots keyed by "pid|name".
+/// Processes seen for the first time are skipped; counters that went
+/// backwards (pid reuse) clamp to zero.
+func diffSnapshots(previous: [String: ProcTraffic],
+                   current: [String: ProcTraffic]) -> [ProcTraffic] {
+    current.compactMap { key, cur in
+        guard let prev = previous[key] else { return nil }
+        let dIn = cur.bytesIn >= prev.bytesIn ? cur.bytesIn - prev.bytesIn : 0
+        let dOut = cur.bytesOut >= prev.bytesOut ? cur.bytesOut - prev.bytesOut : 0
+        return ProcTraffic(name: cur.name, pid: cur.pid, bytesIn: dIn, bytesOut: dOut)
+    }
+}
+
+func snapshotKey(_ p: ProcTraffic) -> String { "\(p.pid)|\(p.name)" }
+
+// MARK: - Process CPU/RAM sampling (parsed from `ps -Aceo pcpu=,rss=,pid=,comm=`)
+
+struct PsProc: Equatable {
+    let name: String
+    let pid: Int32
+    let cpuPercent: Double
+    let rssBytes: UInt64
+}
+
+/// Each row is "<pcpu> <rss-KB> <pid> <comm…>" — comm may contain spaces,
+/// which is why the numeric fields come first.
+func parsePsRows(_ output: String) -> [PsProc] {
+    output.split(whereSeparator: \.isNewline).compactMap { line in
+        let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard fields.count >= 4,
+              let cpu = Double(fields[0]),
+              let rssKB = UInt64(fields[1]),
+              let pid = Int32(fields[2]) else { return nil }
+        let name = fields[3...].joined(separator: " ")
+        return PsProc(name: name, pid: pid, cpuPercent: cpu, rssBytes: rssKB * 1024)
+    }
+}
+
+func topByCPU(_ procs: [PsProc], maxRows: Int = 5) -> [PsProc] {
+    Array(procs.sorted { $0.cpuPercent > $1.cpuPercent }.prefix(maxRows))
+}
+
+func topByMemory(_ procs: [PsProc], maxRows: Int = 5) -> [PsProc] {
+    Array(procs.sorted { $0.rssBytes > $1.rssBytes }.prefix(maxRows))
+}
+
+// MARK: - Disk usage scan (parsed from `du -x -k -d 1 <roots…>`)
+
+struct DirSize: Equatable {
+    let path: String
+    let bytes: UInt64
+    var displayName: String { (path as NSString).lastPathComponent }
+}
+
+/// Rows are "<KB>\t<path>". The roots themselves (aggregate totals) are
+/// dropped, as are hidden directories — they're not actionable in Finder.
+func parseDuRows(_ output: String, roots: [String], maxRows: Int = 5) -> [DirSize] {
+    let rootSet = Set(roots.map { ($0 as NSString).standardizingPath })
+    let entries: [DirSize] = output.split(whereSeparator: \.isNewline).compactMap { line in
+        guard let tab = line.firstIndex(of: "\t"),
+              let kb = UInt64(line[..<tab]) else { return nil }
+        let path = String(line[line.index(after: tab)...]).trimmingCharacters(in: .whitespaces)
+        let standardized = (path as NSString).standardizingPath
+        guard !rootSet.contains(standardized),
+              !(standardized as NSString).lastPathComponent.hasPrefix(".") else { return nil }
+        return DirSize(path: standardized, bytes: kb * 1024)
+    }
+    return Array(entries.sorted { $0.bytes > $1.bytes }.prefix(maxRows))
+}
+
+// MARK: - Human formatting
+
+func bytesHuman(_ bytes: UInt64) -> String {
+    let gb = Double(bytes) / 1_073_741_824
+    if gb >= 100 { return String(format: "%.0f GB", gb) }
+    if gb >= 1 { return String(format: "%.1f GB", gb) }
+    let mb = Double(bytes) / 1_048_576
+    if mb >= 1 { return String(format: "%.0f MB", mb) }
+    return String(format: "%.0f KB", Double(bytes) / 1024)
+}
+
+func fmtPercent(_ value: Double) -> String {
+    String(format: "%.0f%%", min(max(value, 0), 999))
+}
+
+// MARK: - Pinned menu bar title
+
+enum StatKind: String, CaseIterable, Codable {
+    case network, cpu, memory, disk
+}
+
+struct TitleSegment: Equatable {
+    let symbol: String   // SF Symbol name rendered before the text
+    let text: String     // "" for the logo-only segment
+}
+
+/// Builds the menu bar segments for the pinned stats, in canonical order.
+/// With nothing pinned the bar shows just the Neticle glyph.
+func titleSegments(pinned: Set<StatKind>,
+                   downMbps: Double, upMbps: Double,
+                   cpuPercent: Double,
+                   memPercent: Double,
+                   diskPercent: Double) -> [TitleSegment] {
+    var segments: [TitleSegment] = []
+    if pinned.contains(.network) {
+        segments.append(TitleSegment(symbol: "",
+                                     text: "↓ \(fmtMbps(downMbps)) ↑ \(fmtMbps(upMbps)) Mbps"))
+    }
+    if pinned.contains(.cpu) {
+        segments.append(TitleSegment(symbol: "cpu", text: fmtPercent(cpuPercent)))
+    }
+    if pinned.contains(.memory) {
+        segments.append(TitleSegment(symbol: "memorychip", text: fmtPercent(memPercent)))
+    }
+    if pinned.contains(.disk) {
+        segments.append(TitleSegment(symbol: "internaldrive", text: fmtPercent(diskPercent)))
+    }
+    if segments.isEmpty {
+        segments.append(TitleSegment(symbol: "chart.bar.fill", text: ""))
+    }
+    return segments
+}
+
+/// Plain-text rendering of the segments (for the state file / QA).
+func titlePlainText(_ segments: [TitleSegment]) -> String {
+    segments.map { segment in
+        switch segment.symbol {
+        case "cpu": return "CPU " + segment.text
+        case "memorychip": return "RAM " + segment.text
+        case "internaldrive": return "DISK " + segment.text
+        case "chart.bar.fill": return "Neticle"
+        default: return segment.text
+        }
+    }.joined(separator: " · ")
+}
