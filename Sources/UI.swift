@@ -94,8 +94,12 @@ struct StatsView: View {
             Divider().padding(.horizontal, 12)
             footer
         }
-        .frame(width: 380)
-        .frame(maxHeight: 640)
+        // Fixed height, flexible width: NSPopover re-anchors (and visibly
+        // glitches) every time the hosting view's preferred size changes, so
+        // nothing here may resize itself — but the width must adapt to
+        // whatever the popover actually provides (it insets content slightly
+        // on some macOS versions, and a hard width would clip the edges).
+        .frame(minWidth: 340, maxWidth: 380, minHeight: 660, maxHeight: 660)
     }
 
     private var header: some View {
@@ -194,9 +198,23 @@ struct StatsView: View {
                  fraction: store.diskPercent / 100, store: store,
                  accessory: { AnyView(diskAccessory) }) {
             if store.diskTop.isEmpty {
-                NoticeRow(text: store.scanState == .scanning
-                          ? "Scanning your home folder…"
-                          : "Largest folders appear here after a scan")
+                if store.scanState == .scanning {
+                    NoticeRow(text: "Scanning your home folder…")
+                } else {
+                    // Scanning is opt-in: it reads Desktop/Documents/Downloads
+                    // and app data, so macOS shows permission prompts — they
+                    // should happen on the user's click, not at launch.
+                    VStack(spacing: 6) {
+                        NoticeRow(text: "Find the largest folders in your home directory")
+                        Button("Scan largest folders") { store.requestRescan?() }
+                            .controlSize(.small)
+                        Text("macOS may ask to allow access to your folders")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.secondary.opacity(0.7))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 8)
+                }
             } else {
                 ForEach(store.diskTop, id: \.path) { dir in
                     FolderRow(dir: dir)
@@ -267,7 +285,11 @@ private struct Section1<Rows: View>: View {
                 UsageBar(fraction: fraction, tint: tint)
             }
             VStack(spacing: 2) { rows }
+                .frame(maxWidth: .infinity)
                 .padding(8)
+                // Constant card height (5 rows) so sections don't grow and
+                // shrink as lists change — that reflow read as "UI shifting".
+                .frame(height: 134, alignment: .top)
                 .background(RoundedRectangle(cornerRadius: 9)
                     .fill(Color.primary.opacity(0.045)))
         }

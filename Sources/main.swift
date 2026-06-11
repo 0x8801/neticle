@@ -60,6 +60,8 @@ struct AppState: Codable {
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate {
+    static let popoverSize = NSSize(width: 380, height: 660)   // matches StatsView's fixed frame
+
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private let store = StatsStore()
@@ -85,6 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         popover.behavior = .transient
         popover.animates = false
         popover.delegate = self
+        popover.contentSize = Self.popoverSize
         // Content is created lazily on open and torn down on close: a live
         // NSHostingView re-renders on every published sample even while the
         // popover is hidden, which costs real CPU in a 1 s-tick app.
@@ -110,7 +113,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
             self.store.scanState = self.diskScanner.state
             self.writeState()
         }
-        diskScanner.rescan()
+        // No scan at launch: du touches TCC-protected folders (Desktop,
+        // Documents, Downloads, app data), and each category triggers its own
+        // macOS permission prompt. The user starts scans from the popover.
 
         _ = rateSampler.sample()                   // prime the counters
         _ = cpuSampler.sample()
@@ -165,7 +170,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         if popover.isShown {
             popover.performClose(nil)
         } else if let button = statusItem.button {
-            popover.contentViewController = NSHostingController(rootView: StatsView(store: store))
+            let hosting = NSHostingController(rootView: StatsView(store: store))
+            // Keep the popover a fixed size: NSHostingController's automatic
+            // preferredContentSize updates make NSPopover re-anchor and glitch
+            // whenever rows change, so they're disabled outright.
+            if #available(macOS 13.0, *) {
+                hosting.sizingOptions = []
+            }
+            hosting.preferredContentSize = Self.popoverSize
+            popover.contentViewController = hosting
+            popover.contentSize = Self.popoverSize
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
             NSApp.activate(ignoringOtherApps: true)

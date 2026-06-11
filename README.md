@@ -11,7 +11,8 @@ disk — each with a top-5 list and quick actions.
     in the background only cheap snapshots run.
   - **CPU** — total usage plus the top 5 processes.
   - **Memory** — used/total plus the top 5 processes by resident size.
-  - **Disk** — used/total plus your largest home folders (rescannable).
+  - **Disk** — used/total, plus an on-demand scan of your largest home
+    folders (the scan never runs at launch — see Permissions below).
   - Hover a process row to **terminate** it (click the ✕ twice to confirm)
     or **view its recent logs** in Console. Hover a folder row to **reveal it
     in Finder** so you can clean things up.
@@ -27,6 +28,17 @@ burst as Activity Monitor's network tab — it stops when the popover closes).
 The network totals come from physical interface byte counters (`en*`,
 `pdp_ip*`, `ppp*`; tunnels like `utun` are excluded so VPNs don't
 double-count).
+
+## Permissions
+
+Network, CPU, and memory stats need **no permissions**. The disk folder
+scan reads Desktop, Documents, Downloads, and app data — locations macOS
+protects — so the first scan triggers the standard permission prompts, one
+per category. That's why the scan only runs when you click **Scan largest
+folders** in the popover, never at launch. macOS remembers what you allow
+(deny something and that folder is simply skipped). To skip the prompts
+entirely, grant Neticle **Full Disk Access** in System Settings → Privacy &
+Security.
 
 ## Install (from a GitHub release)
 
