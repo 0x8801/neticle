@@ -236,10 +236,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopo
         if let disk = sampleDisk() {
             store.disk = disk
         }
+        // Neticle's own footprint (the app plus its nettop/du helpers) is
+        // hidden from the top lists — seeing the monitor's sampler ranked #1
+        // confused more than it informed. Totals still include everything.
+        // The exclusion set is built when ps results arrive, not when the
+        // tick starts, so helpers spawned in between are still caught.
         processSampler.sample { [weak self] procs in
             guard let self else { return }
-            self.store.cpuTop = topByCPU(procs)
-            self.store.memTop = topByMemory(procs)
+            var ownPids = Set(self.nettop.helperPids)
+            ownPids.insert(ProcessInfo.processInfo.processIdentifier)
+            if let duPid = self.diskScanner.helperPid { ownPids.insert(duPid) }
+            let visible = procs.filter { !ownPids.contains($0.pid) }
+            self.store.cpuTop = topByCPU(visible)
+            self.store.memTop = topByMemory(visible)
         }
     }
 

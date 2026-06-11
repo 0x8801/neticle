@@ -108,6 +108,11 @@ the app detects this and says so in each section.
 - CPU totals come from `host_processor_info` tick deltas, memory from
   `host_statistics64` (active + wired + compressed), disk from `statfs`, and
   per-process CPU/RSS from one `ps -Aceo` call per 3 s tick.
+- Neticle's own footprint — the app and its helper children (the
+  popover-open nettop stream, background nettop snapshots, du scans) — is
+  excluded from the top-5 lists by pid, so the monitor doesn't list its own
+  sampling as a consumer. The headline totals still include everything, and
+  an unrelated `nettop`/`du` you run yourself still shows up.
 - The popover's SwiftUI hierarchy is created on open and torn down on close:
   a hidden `NSHostingView` re-renders on every published sample, which costs
   real CPU in an app that ticks every second.

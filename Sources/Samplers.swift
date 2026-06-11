@@ -92,8 +92,19 @@ final class NettopMonitor {
     private let queue = DispatchQueue(label: "neticle.nettop", qos: .utility)
 
     private var streamProcess: Process?
+    private var streamSource: DispatchSourceRead?
     private var streamParser = NettopStreamParser()
+    private var snapshotPid: Int32?
     var isStreaming: Bool { streamProcess != nil }
+
+    /// PIDs of nettop helpers currently alive — excluded from the CPU/memory
+    /// top lists so the app's own sampling doesn't show up as a consumer.
+    var helperPids: [Int32] {
+        var pids: [Int32] = []
+        if let stream = streamProcess { pids.append(stream.processIdentifier) }
+        if let pid = snapshotPid { pids.append(pid) }
+        return pids
+    }
 
     init(cadence: TimeInterval = 3) {
         self.cadence = cadence
@@ -118,46 +129,69 @@ final class NettopMonitor {
     func beginLiveStream() {
         guard !isStreaming, !unavailable else { return }
         streamParser = NettopStreamParser()
-        let p = Process()
-        // nettop block-buffers stdout when piped; `script -q /dev/null` gives
-        // it a PTY so every 2 s sample flushes immediately.
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/script")
-        p.arguments = ["-q", "/dev/null",
-                       "/usr/bin/nettop", "-P", "-d", "-x", "-J", "bytes_in,bytes_out",
-                       "-s", String(streamInterval), "-L", "0"]
-        p.standardInput = FileHandle.nullDevice
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if data.isEmpty {                      // EOF
-                handle.readabilityHandler = nil
-                return
-            }
-            guard let text = String(data: data, encoding: .utf8) else { return }
-            // .common keeps updates flowing while the popover has key focus.
-            RunLoop.main.perform(inModes: [.common]) { [weak self] in
-                self?.ingestStream(text)
-            }
-            CFRunLoopWakeUp(CFRunLoopGetMain())
+        // nettop block-buffers stdout when piped, so give it a PTY (it then
+        // line-buffers and every 2 s sample flushes immediately). The PTY is
+        // allocated in-process rather than via `script` so nettop is a direct
+        // child — its pid must be known to hide it from the CPU top list.
+        var master: Int32 = -1
+        var slave: Int32 = -1
+        // A real window size matters: a 0×0 PTY makes nettop exit immediately.
+        var ws = winsize(ws_row: 50, ws_col: 300, ws_xpixel: 0, ws_ypixel: 0)
+        guard openpty(&master, &slave, nil, nil, &ws) == 0 else {
+            NSLog("Neticle: openpty failed")
+            return
         }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
+        p.arguments = ["-P", "-d", "-x", "-J", "bytes_in,bytes_out",
+                       "-s", String(streamInterval), "-L", "0"]
+        let slaveHandle = FileHandle(fileDescriptor: slave, closeOnDealloc: false)
+        p.standardOutput = slaveHandle
+        p.standardInput = slaveHandle      // nettop expects its tty on stdin too
+        p.standardError = FileHandle.nullDevice
         p.terminationHandler = { [weak self] proc in
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.streamProcess === proc else { return }
-                self.streamProcess = nil           // died on its own; reopen restarts
+                self.teardownStream()              // died on its own; reopen restarts
             }
         }
         do {
             try p.run()
-            streamProcess = p
         } catch {
             NSLog("Neticle: failed to start nettop stream: \(error)")
+            close(master)
+            close(slave)
+            return
         }
+        close(slave)        // the child holds its own copy; ours must go or EOF never arrives
+        streamProcess = p
+        let source = DispatchSource.makeReadSource(fileDescriptor: master, queue: .main)
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            var buffer = [UInt8](repeating: 0, count: 16384)
+            let n = read(master, &buffer, buffer.count)
+            if n > 0 {
+                // nettop's CSV is pure ASCII, so chunk boundaries are safe.
+                if let text = String(bytes: buffer[0..<n], encoding: .utf8) {
+                    self.ingestStream(text)
+                }
+            } else {
+                self.teardownStream()              // EOF/EIO: nettop is gone
+            }
+        }
+        source.setCancelHandler { close(master) }
+        source.resume()
+        streamSource = source
     }
 
     func endLiveStream() {
-        streamProcess?.terminate()
+        teardownStream()
+    }
+
+    private func teardownStream() {
+        streamSource?.cancel()
+        streamSource = nil
+        streamProcess?.terminate()   // EOF/EIO does not guarantee the child exited
         streamProcess = nil
     }
 
@@ -183,6 +217,8 @@ final class NettopMonitor {
             p.standardError = FileHandle.nullDevice
             var rows: [ProcTraffic] = []
             if (try? p.run()) != nil {
+                let pid = p.processIdentifier
+                DispatchQueue.main.async { [weak self] in self?.snapshotPid = pid }
                 var data = Data()
                 while true {
                     let chunk = pipe.fileHandleForReading.availableData
@@ -198,6 +234,10 @@ final class NettopMonitor {
 
     private func ingest(_ rows: [ProcTraffic]) {
         inFlight = false
+        // snapshotPid is intentionally NOT cleared here: ps may have sampled
+        // the one-shot while it was alive but deliver results after it exits.
+        // The pid persists until the next one-shot overwrites it — pid reuse
+        // within one cadence is not a realistic concern.
         guard !rows.isEmpty else {
             consecutiveFailures += 1
             if consecutiveFailures >= 3 {
@@ -333,7 +373,9 @@ final class ProcessListSampler {
             guard (try? p.run()) != nil else { return }
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
+            // ps lists itself; that's our own sampling, not a real consumer.
             let procs = parsePsRows(String(data: data, encoding: .utf8) ?? "")
+                .filter { $0.pid != p.processIdentifier }
             DispatchQueue.main.async { completion(procs) }
         }
     }
@@ -367,6 +409,10 @@ final class DiskScanner {
         process?.terminate()
     }
 
+    /// PID of a du currently scanning — excluded from the CPU/memory top
+    /// lists so the app's own scan doesn't show up as a consumer.
+    var helperPid: Int32? { process?.processIdentifier }
+
     func rescan() {
         guard state != .scanning else { return }
         state = .scanning
@@ -399,6 +445,7 @@ final class DiskScanner {
             let rows = parseDuRows(String(data: data, encoding: .utf8) ?? "", roots: roots)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
+                self.process = nil   // exited; don't keep excluding a reused pid
                 self.top = rows
                 self.state = .done(Date())
                 self.onUpdate?()
